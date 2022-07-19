@@ -152,7 +152,7 @@ def test_model(model, tokenizer, args):
 
         (generated,) = model.generate(
             sequence_tensor,
-            max_length=len(history[0]) + 30,
+            max_length=sequence_tensor.shape[1] + 30,
         )
 
         print("belief:", tokenizer.decode(generated[sequence_tensor.shape[1]:]))
