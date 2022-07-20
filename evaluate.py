@@ -6,6 +6,7 @@ from itertools import chain
 import warnings
 
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 from ignite.metrics import Bleu
 from transformers import (
@@ -241,6 +242,7 @@ def sample_sequence(model, tokenizer, history, belief, kb, args):
 
 def main():
     parser = ArgumentParser()
+    # TODO: add max_turn argument to limit number of history turns
     parser.add_argument("--testset", type=str,
                         default="data/test.soloist.json", help="Dataset for evaulating model performance")
     parser.add_argument("--checkpoint", type=str,
@@ -275,7 +277,7 @@ def main():
     metrics = {"bleu": Bleu(), "inform": Inform(), "success": Success()}
     metrics.update({"combined": Combined(metrics)})
     with torch.no_grad():
-        for ent in testset:
+        for ent in tqdm(testset, desc="Evaluating model"):
             # Round 1: generating belief
             belief = sample_sequence(model=model,
                                      tokenizer=tokenizer,
@@ -283,6 +285,7 @@ def main():
                                      belief=None,
                                      kb=None,
                                      args=args)
+            belief = tokenizer.decode(belief)
             kb = query_knowledge_base(dbs, columns, belief)
 
             # Round 2: generating response from belief
@@ -292,12 +295,13 @@ def main():
                                     belief=belief,
                                     kb=kb,
                                     args=args)
+            reply = tokenizer.decode(reply)
 
             for name, metric in metrics.items():
-                metric.update((reply.split(), [[ent["reply"].split()]]))
+                metric.update(([reply.split()], [[ent["reply"].split()]]))
 
     for name, metric in metrics.items():
-        print("{}: {}".format(name, metric.compute()))
+        print("{}: {:.4f}".format(name, metric.compute()))
 
 
 if __name__ == "__main__":
