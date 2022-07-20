@@ -217,6 +217,9 @@ def sample_sequence(model, tokenizer, history, belief, kb, args):
         input_ids = create_input_ids(sequence)
         token_type_ids = create_token_type_ids(tokenizer, sequence)
 
+        input_ids = input_ids.to(args.device)
+        token_type_ids= token_type_ids.to(args.device)
+
         logits = model(input_ids, token_type_ids=token_type_ids)
         if isinstance(logits, tuple):  # for gpt2 and maybe others
             logits = logits[0]
@@ -248,7 +251,7 @@ def main():
     parser.add_argument("--checkpoint", type=str,
                         default="", help="Path, url or short name of the model")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
-                        else "cpu", help="Device (cuda or cpu)")
+                        else "cuda", help="Device (cuda or cpu)")
     parser.add_argument("--max_length", type=int, default=20,
                         help="Maximum length of the output utterances")
     parser.add_argument("--min_length", type=int, default=1,
@@ -273,6 +276,7 @@ def main():
     with open(args.testset, "r") as f:
         testset = json.load(f)
 
+    model.to(args.device)
     model.eval()
     metrics = {"bleu": Bleu(), "inform": Inform(), "success": Success()}
     metrics.update({"combined": Combined(metrics)})
