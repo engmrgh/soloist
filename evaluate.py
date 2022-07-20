@@ -245,14 +245,13 @@ def sample_sequence(model, tokenizer, history, belief, kb, args):
 
 def main():
     parser = ArgumentParser()
-    # TODO: add max_turn argument to limit number of history turns
     parser.add_argument("--testset", type=str,
                         default="data/test.soloist.json", help="Dataset for evaulating model performance")
     parser.add_argument("--checkpoint", type=str,
                         default="", help="Path, url or short name of the model")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
                         else "cuda", help="Device (cuda or cpu)")
-    parser.add_argument("--max_length", type=int, default=20,
+    parser.add_argument("--max_length", type=int, default=50,
                         help="Maximum length of the output utterances")
     parser.add_argument("--min_length", type=int, default=1,
                         help="Minimum length of the output utterances")
@@ -265,6 +264,8 @@ def main():
                         help="Filter top-k tokens before sampling (<=0: no filtering)")
     parser.add_argument("--top_p", type=float, default=0.9,
                         help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
+    parser.add_argument("--max_turn", type=int, default=5,
+                        help="Maximum number of history turns fed to model")
 
     args = parser.parse_args()
 
@@ -285,7 +286,7 @@ def main():
             # Round 1: generating belief
             belief = sample_sequence(model=model,
                                      tokenizer=tokenizer,
-                                     history=ent["history"],
+                                     history=ent["history"][-args.max_turn:],
                                      belief=None,
                                      kb=None,
                                      args=args)
@@ -295,7 +296,7 @@ def main():
             # Round 2: generating response from belief
             reply = sample_sequence(model=model,
                                     tokenizer=tokenizer,
-                                    history=ent["history"],
+                                    history=ent["history"][-args.max_turn:],
                                     belief=belief,
                                     kb=kb,
                                     args=args)
