@@ -103,7 +103,7 @@ def make_logdir(model_name: str):
 def get_data_loaders(args, tokenizer):
     # Load train dataset
     if args.train_cache and os.path.exists(args.train_cache):
-        logger.info("Loading train dataset from cache {}".format(args.val_cache))
+        logger.info("Loading train dataset from cache {}".format(args.train_cache))
         train_dataset = torch.load(args.train_cache)
     else:
         logger.info("Loading train dataset from file {}".format(args.train_dataset))
@@ -111,7 +111,8 @@ def get_data_loaders(args, tokenizer):
             SoloistDataset(args.train_dataset,
                             tokenizer,
                             max_seq_length=args.max_seq_length,
-                            max_turns=args.max_turns)
+                            max_turns=args.max_turns,
+                            n_fake_instances=args.n_fake_instances)
 
         if args.train_cache:
             p = Path(args.train_cache)
@@ -123,7 +124,8 @@ def get_data_loaders(args, tokenizer):
                 batch_size=args.train_batch_size,
                 collate_fn=partial(collate_fn,
                                     pad_token_id=tokenizer.pad_token_id,
-                                    max_seq_len=args.max_seq_length),
+                                    max_seq_len=args.max_seq_length,
+                                    n_fake_instances=args.n_fake_instances),
                 shuffle=True)
 
     # Load validation dataset
@@ -137,7 +139,8 @@ def get_data_loaders(args, tokenizer):
             SoloistDataset(args.val_dataset,
                             tokenizer,
                             max_seq_length=args.max_seq_length,
-                            max_turns=args.max_turns)
+                            max_turns=args.max_turns,
+                            n_fake_instances=args.n_fake_instances)
 
         if args.val_cache:
             p = Path(args.val_cache)
@@ -150,7 +153,8 @@ def get_data_loaders(args, tokenizer):
                     batch_size=args.valid_batch_size,
                     collate_fn=partial(collate_fn,
                                         pad_token_id=tokenizer.pad_token_id,
-                                        max_seq_len=args.max_seq_length),
+                                        max_seq_len=args.max_seq_length,
+                                        n_fake_instances=args.n_fake_instances),
                     shuffle=False)
     else:
         valid_loader = None
@@ -241,6 +245,8 @@ def train():
                         help="Max sequence which all sequences will be padded")
     parser.add_argument("--max_turns", type=int, default=5,
                         help="Max history turns fed to model")
+    parser.add_argument("--n_fake_instances", type=int, default=10,
+                        help="Number of generated fake instances to train reply, belief contradiction")
     args = parser.parse_args()
 
     # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only,

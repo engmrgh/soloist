@@ -16,16 +16,16 @@ logger = logging.getLogger(__file__)
 logging.basicConfig(level=logging.INFO)
 
 
-N_CANDIDATE = 4
 MODEL_VECTOR_INPUTS = ["input_ids", "lm_labels", "token_type_ids"]
 ALL_MODEL_INPUTS = MODEL_VECTOR_INPUTS + ["mc_label", "mc_token_ids"]
 
 
 class SoloistDataset(Dataset):
-    def __init__(self, dataset_path, tokenizer, max_seq_length, max_turns):
+    def __init__(self, dataset_path, tokenizer, max_seq_length, max_turns, n_fake_instances):
         logger.info("Loading dataset from {}...".format(dataset_path))
         self._max_seq_length = max_seq_length
         self._max_turns = max_turns
+        self._n_fake_instances = n_fake_instances
         self._examples = self.load_dataset(dataset_path, tokenizer)
 
     def load_dataset(self, dataset_path, tokenizer):
@@ -61,33 +61,39 @@ class SoloistDataset(Dataset):
 
             examples = list()
             for record in tqdm(data):
-                false_belief = belief_pool[random.randrange(len(belief_pool))]
-                false_reply = reply_pool[random.randrange(len(reply_pool))]
-
                 sample = list()
-                sample_has_valid_length = True
-                for i, belief in enumerate((record["belief"], false_belief)):
-                    for j, reply in enumerate((record["reply"], false_reply)):
-                        kb = record.get("kb", "")
-                        sample.append(
-                            self._build_input_from_segments(
-                                tokenizer,
-                                record["history"][-self._max_turns:],
-                                belief,
-                                kb,
-                                reply,
-                                fake=(not i | j),
-                            )
-                        )
 
-                        if sample[-1]["input_ids"].shape[0] > self._max_seq_length:
-                            sample_has_valid_length = False
-                            break
-                    if not sample_has_valid_length:
-                        break
+                # Real instance
+                s = self._build_input_from_segments(
+                        tokenizer,
+                        record["history"][-self._max_turns:],
+                        record["belief"],
+                        record.get("kb", ""),
+                        record["reply"],
+                        fake=False,
+                    )
+                if s["input_ids"].shape[0] > self._max_seq_length:
+                    continue
+                sample.append(s)
 
-                if sample_has_valid_length:
-                    examples.append(sample)
+                # Generating fake examples for contradiction loss
+                fake_counter = 0
+                while fake_counter < self._n_fake_instances:
+                    false_belief = belief_pool[random.randrange(len(belief_pool))]
+                    false_reply = reply_pool[random.randrange(len(reply_pool))]
+                    s = self._build_input_from_segments(
+                        tokenizer,
+                        record["history"][-self._max_turns:],
+                        false_belief,
+                        record.get("kb", ""),
+                        false_reply,
+                        fake=True,
+                    )
+                    if s["input_ids"].shape[0] <= self._max_seq_length:
+                        sample.append(s)
+                        fake_counter += 1
+
+                examples.append(sample)
 
         return examples
 
@@ -140,7 +146,7 @@ class SoloistDataset(Dataset):
         return example
 
 
-def collate_fn(batch, pad_token_id, max_seq_len):
+def collate_fn(batch, pad_token_id, max_seq_len, n_fake_instances):
 
     proc_batch = {input_name: list() for input_name in ALL_MODEL_INPUTS}
 
@@ -159,7 +165,7 @@ def collate_fn(batch, pad_token_id, max_seq_len):
             attention[-(max_seq_len - len(vector)):] = [1] * (max_seq_len - len(vector))
         attention_mask.append(attention)
     attention_mask = torch.as_tensor(attention_mask)
-    attention_mask = attention_mask.view((-1, N_CANDIDATE, max_seq_len))
+    attention_mask = attention_mask.view((-1, (n_fake_instances + 1), max_seq_len))
 
     for input_name in MODEL_VECTOR_INPUTS:
         for idx, vector in enumerate(proc_batch[input_name]):
@@ -171,10 +177,10 @@ def collate_fn(batch, pad_token_id, max_seq_len):
 
         proc_batch[input_name] = torch.stack(proc_batch[input_name])
         proc_batch[input_name] = proc_batch[input_name].view(
-            (-1, N_CANDIDATE, max_seq_len))
+            (-1, (n_fake_instances + 1), max_seq_len))
 
     proc_batch["mc_token_ids"] = proc_batch["mc_token_ids"].view(
-        (-1, N_CANDIDATE))
+        (-1, (n_fake_instances + 1)))
 
     return (
         proc_batch["input_ids"].to(torch.int64),
