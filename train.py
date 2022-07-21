@@ -119,15 +119,6 @@ def get_data_loaders(args, tokenizer):
             p.parent.mkdir(exist_ok=True, parents=True)
             torch.save(train_dataset, args.train_cache)
 
-    train_loader = \
-        DataLoader(train_dataset,
-                batch_size=args.train_batch_size,
-                collate_fn=partial(collate_fn,
-                                    pad_token_id=tokenizer.pad_token_id,
-                                    max_seq_len=args.max_seq_length,
-                                    n_fake_instances=args.n_fake_instances),
-                shuffle=True)
-
     # Load validation dataset
     valid_dataset = None
     if args.val_cache and os.path.exists(args.val_cache):
@@ -146,18 +137,28 @@ def get_data_loaders(args, tokenizer):
             p = Path(args.val_cache)
             p.parent.mkdir(exist_ok=True, parents=True)
             torch.save(valid_dataset, args.val_cache)
-
-    if valid_dataset:
-        valid_loader = \
-            DataLoader(valid_dataset,
-                    batch_size=args.valid_batch_size,
-                    collate_fn=partial(collate_fn,
-                                        pad_token_id=tokenizer.pad_token_id,
-                                        max_seq_len=args.max_seq_length,
-                                        n_fake_instances=args.n_fake_instances),
-                    shuffle=False)
     else:
-        valid_loader = None
+        train_dataset_size = int(0.9 * len(train_dataset))
+        val_dataset_size = len(train_dataset) - train_dataset_size
+        train_dataset, valid_dataset = torch.utils.data.random_split(train_dataset, [train_dataset_size, val_dataset_size])
+
+    train_loader = \
+        DataLoader(train_dataset,
+                batch_size=args.train_batch_size,
+                collate_fn=partial(collate_fn,
+                                    pad_token_id=tokenizer.pad_token_id,
+                                    max_seq_len=args.max_seq_length,
+                                    n_fake_instances=args.n_fake_instances),
+                shuffle=True)
+
+    valid_loader = \
+        DataLoader(valid_dataset,
+                batch_size=args.valid_batch_size,
+                collate_fn=partial(collate_fn,
+                                    pad_token_id=tokenizer.pad_token_id,
+                                    max_seq_len=args.max_seq_length,
+                                    n_fake_instances=args.n_fake_instances),
+                shuffle=False)
 
     return train_loader, valid_loader
 
@@ -210,7 +211,6 @@ def test_model(model, tokenizer, args):
 
 
 def train():
-    # TODO: read about fp16
     parser = ArgumentParser()
     parser.add_argument("--train_dataset", type=str, default="",
                         help="Path of the training dataset")
@@ -315,21 +315,19 @@ def train():
             lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
             return (lm_logits_flat_shifted, mc_logits), (lm_labels_flat_shifted, mc_labels)
 
-    if args.val_dataset or \
-        args.val_cache:
-        evaluator = Engine(inference)
+    evaluator = Engine(inference)
 
-        # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
-        trainer.add_event_handler(Events.EPOCH_COMPLETED,
-                                  lambda _: evaluator.run(val_loader))
-        trainer.add_event_handler(Events.ITERATION_STARTED(every=50),
-                                  lambda _: test_model(model, tokenizer, args))
-        if args.n_epochs < 1:
-            trainer.add_event_handler(
-                Events.COMPLETED, lambda _: evaluator.run(val_loader))
-        if args.eval_before_start:
-            trainer.add_event_handler(
-                Events.STARTED, lambda _: evaluator.run(val_loader))
+    # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
+    trainer.add_event_handler(Events.EPOCH_COMPLETED,
+                                lambda _: evaluator.run(val_loader))
+    trainer.add_event_handler(Events.ITERATION_STARTED(every=50),
+                                lambda _: test_model(model, tokenizer, args))
+    if args.n_epochs < 1:
+        trainer.add_event_handler(
+            Events.COMPLETED, lambda _: evaluator.run(val_loader))
+    if args.eval_before_start:
+        trainer.add_event_handler(
+            Events.STARTED, lambda _: evaluator.run(val_loader))
 
     # Linearly decrease the learning rate from lr to zero
     scheduler = PiecewiseLinear(
@@ -337,26 +335,22 @@ def train():
     trainer.add_event_handler(Events.ITERATION_STARTED, scheduler)
 
     # Prepare metrics
-    if args.val_dataset or \
-        args.val_cache:
-        RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
-        metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
-                "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
-        metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
-                        "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
-        metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
-        for name, metric in metrics.items():
-            metric.attach(evaluator, name)
+    RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
+    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
+            "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
+    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
+                    "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
+    metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
+    for name, metric in metrics.items():
+        metric.attach(evaluator, name)
 
     # On the main process: add progress bar, tensorboard, checkpoints and save model, configuration and tokenizer
     # before we start to train
     pbar = ProgressBar(persist=True)
     pbar.attach(trainer, metric_names=["loss"])
 
-    if args.val_dataset or \
-        args.val_cache:
-        evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message(
-            "Validation: %s" % pformat(evaluator.state.metrics)))
+    evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message(
+        "Validation: %s" % pformat(evaluator.state.metrics)))
 
     log_dir = make_logdir(args.pretrained_model_path)
     tb_logger = TensorboardLogger(log_dir)
@@ -365,11 +359,8 @@ def train():
         tag="training", metric_names=["loss"]), event_name=Events.ITERATION_COMPLETED)
     tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(
         optimizer), event_name=Events.ITERATION_STARTED)
-
-    if args.val_dataset or \
-        args.val_cache:
-        tb_logger.attach(evaluator, log_handler=OutputHandler(tag="validation", metric_names=list(
-            metrics.keys()), global_step_transform=global_step_from_engine(trainer)), event_name=Events.EPOCH_COMPLETED)
+    tb_logger.attach(evaluator, log_handler=OutputHandler(tag="validation", metric_names=list(
+        metrics.keys()), global_step_transform=global_step_from_engine(trainer)), event_name=Events.EPOCH_COMPLETED)
 
     checkpoint_handler = ModelCheckpoint(
         log_dir, 'checkpoint', save_interval=1, n_saved=3)
