@@ -68,12 +68,13 @@ class SoloistDataset(Dataset):
                 sample_has_valid_length = True
                 for i, belief in enumerate((record["belief"], false_belief)):
                     for j, reply in enumerate((record["reply"], false_reply)):
+                        kb = record.get("kb", "")
                         sample.append(
                             self._build_input_from_segments(
                                 tokenizer,
                                 record["history"][-self._max_turns:],
                                 belief,
-                                record["kb"],
+                                kb,
                                 reply,
                                 fake=(not i | j),
                             )

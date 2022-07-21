@@ -192,7 +192,7 @@ def get_sequence(tokenizer, history, belief, kb, current_output):
     ind, eob, eokb = tokenizer.convert_tokens_to_ids(["=>", "<eob>", "<eokb>"])
 
     if belief and kb:
-        history, belief, kb = segments_encoder(
+        history, belief, kb, _ = segments_encoder(
             tokenizer, history, belief, kb, reply=None)
         return (
             [list(chain(*history)) + [ind]] +
@@ -201,7 +201,7 @@ def get_sequence(tokenizer, history, belief, kb, current_output):
             [current_output]
         )
     else:
-        (history,) = segments_encoder(tokenizer, history, belief, kb, reply=None)
+        history, *_ = segments_encoder(tokenizer, history, belief=None, kb=None, reply=None)
         return (
             [list(chain(*history)) + [ind]] +
             [current_output]

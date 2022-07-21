@@ -101,31 +101,59 @@ def make_logdir(model_name: str):
 
 
 def get_data_loaders(args, tokenizer):
-    if os.path.exists(args.cache):
-        logger.info("Loading dataset from {}".format(args.cache))
-        train_dataset = torch.load(os.path.join(
-            args.cache, 'train.soloist.dataset'))
-        valid_dataset = torch.load(os.path.join(
-            args.cache, 'valid.soloist.dataset'))
+    # Load train dataset
+    if args.train_cache and os.path.exists(args.train_cache):
+        logger.info("Loading train dataset from cache {}".format(args.val_cache))
+        train_dataset = torch.load(args.train_cache)
     else:
-        os.mkdir(args.cache)
+        logger.info("Loading train dataset from file {}".format(args.train_dataset))
+        train_dataset = \
+            SoloistDataset(args.train_dataset,
+                            tokenizer,
+                            max_seq_length=args.max_seq_length,
+                            max_turns=args.max_turns)
 
-        train_dataset = SoloistDataset(
-            os.path.join(args.dataset_path, 'train.soloist.json'),
-            tokenizer, max_seq_length=args.max_seq_length, max_turns=args.max_turns)
-        torch.save(train_dataset, os.path.join(
-            args.cache, 'train.soloist.dataset'))
+        if args.train_cache:
+            p = Path(args.train_cache)
+            p.parent.mkdir(exist_ok=True, parents=True)
+            torch.save(train_dataset, args.train_cache)
 
-        valid_dataset = SoloistDataset(
-            os.path.join(args.dataset_path, 'valid.soloist.json'),
-            tokenizer, max_seq_length=args.max_seq_length, max_turns=args.max_turns)
-        torch.save(valid_dataset, os.path.join(
-            args.cache, 'valid.soloist.dataset'))
+    train_loader = \
+        DataLoader(train_dataset,
+                batch_size=args.train_batch_size,
+                collate_fn=partial(collate_fn,
+                                    pad_token_id=tokenizer.pad_token_id,
+                                    max_seq_len=args.max_seq_length),
+                shuffle=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.train_batch_size, collate_fn=partial(
-        collate_fn, pad_token_id=tokenizer.pad_token_id, max_seq_len=args.max_seq_length), shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.valid_batch_size, collate_fn=partial(
-        collate_fn, pad_token_id=tokenizer.pad_token_id, max_seq_len=args.max_seq_length), shuffle=False)
+    # Load validation dataset
+    valid_dataset = None
+    if args.val_cache and os.path.exists(args.val_cache):
+        logger.info("Loading validation dataset from cache {}".format(args.val_cache))
+        valid_dataset = torch.load(args.val_cache)
+    elif args.val_dataset:
+        logger.info("Loading validation dataset from file {}".format(args.val_dataset))
+        valid_dataset = \
+            SoloistDataset(args.val_dataset,
+                            tokenizer,
+                            max_seq_length=args.max_seq_length,
+                            max_turns=args.max_turns)
+
+        if args.val_cache:
+            p = Path(args.val_cache)
+            p.parent.mkdir(exist_ok=True, parents=True)
+            torch.save(valid_dataset, args.val_cache)
+
+    if valid_dataset:
+        valid_loader = \
+            DataLoader(valid_dataset,
+                    batch_size=args.valid_batch_size,
+                    collate_fn=partial(collate_fn,
+                                        pad_token_id=tokenizer.pad_token_id,
+                                        max_seq_len=args.max_seq_length),
+                    shuffle=False)
+    else:
+        valid_loader = None
 
     return train_loader, valid_loader
 
@@ -178,11 +206,17 @@ def test_model(model, tokenizer, args):
 
 
 def train():
+    # TODO: add n_candidates in the config
+    # TODO: read about fp16
     parser = ArgumentParser()
-    parser.add_argument("--dataset_path", type=str, default="data",
-                        help="Path or url of the dataset. If empty download from S3.")
-    parser.add_argument("--cache", type=str, default=".cache",
-                        help="Path or url of the dataset cache")
+    parser.add_argument("--train_dataset", type=str, default="",
+                        help="Path of the training dataset")
+    parser.add_argument('--val_dataset', type=str, default="",
+                        help="Path of the validation dataset.")
+    parser.add_argument("--train_cache", type=str, default="",
+                        help="Path of the train dataset cache")
+    parser.add_argument("--val_cache", type=str, default="",
+                        help="Path of the validation dataset cache")
     parser.add_argument("--pretrained_model_path", type=str,
                         default="gpt2", help="Pretrained model name or ")
     parser.add_argument("--model_checkpoint", type=str,
@@ -217,7 +251,7 @@ def train():
     logger.info("Prepare tokenizer, pretrained model and optimizer.")
     # cant use Autotokenizer because checkpoint could be a Path
     tokenizer_class = GPT2Tokenizer if "gpt2" in args.pretrained_model_path else OpenAIGPTTokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained(args.pretrained_model_path)
+    tokenizer = tokenizer_class.from_pretrained(args.pretrained_model_path)
 
     model_class = GPT2DoubleHeadsModel if "gpt2" in args.pretrained_model_path else OpenAIGPTDoubleHeadsModel
     model = model_class.from_pretrained(args.pretrained_model_path)
@@ -263,18 +297,22 @@ def train():
                                                :].contiguous().view(-1, lm_logits.size(-1))
             lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
             return (lm_logits_flat_shifted, mc_logits), (lm_labels_flat_shifted, mc_labels)
-    evaluator = Engine(inference)
 
-    # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
-    trainer.add_event_handler(Events.EPOCH_COMPLETED,
-                              lambda _: evaluator.run(val_loader))
-    trainer.add_event_handler(Events.ITERATION_STARTED(every=50), lambda _: test_model(model, tokenizer, args))
-    if args.n_epochs < 1:
-        trainer.add_event_handler(
-            Events.COMPLETED, lambda _: evaluator.run(val_loader))
-    if args.eval_before_start:
-        trainer.add_event_handler(
-            Events.STARTED, lambda _: evaluator.run(val_loader))
+    if args.val_dataset or \
+        args.val_cache:
+        evaluator = Engine(inference)
+
+        # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
+        trainer.add_event_handler(Events.EPOCH_COMPLETED,
+                                  lambda _: evaluator.run(val_loader))
+        trainer.add_event_handler(Events.ITERATION_STARTED(every=50),
+                                  lambda _: test_model(model, tokenizer, args))
+        if args.n_epochs < 1:
+            trainer.add_event_handler(
+                Events.COMPLETED, lambda _: evaluator.run(val_loader))
+        if args.eval_before_start:
+            trainer.add_event_handler(
+                Events.STARTED, lambda _: evaluator.run(val_loader))
 
     # Linearly decrease the learning rate from lr to zero
     scheduler = PiecewiseLinear(
@@ -282,21 +320,26 @@ def train():
     trainer.add_event_handler(Events.ITERATION_STARTED, scheduler)
 
     # Prepare metrics
-    RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
-    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
-               "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
-    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
-                    "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
-    metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
-    for name, metric in metrics.items():
-        metric.attach(evaluator, name)
+    if args.val_dataset or \
+        args.val_cache:
+        RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
+        metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
+                "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
+        metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
+                        "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
+        metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
+        for name, metric in metrics.items():
+            metric.attach(evaluator, name)
 
     # On the main process: add progress bar, tensorboard, checkpoints and save model, configuration and tokenizer
     # before we start to train
     pbar = ProgressBar(persist=True)
     pbar.attach(trainer, metric_names=["loss"])
-    evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message(
-        "Validation: %s" % pformat(evaluator.state.metrics)))
+
+    if args.val_dataset or \
+        args.val_cache:
+        evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message(
+            "Validation: %s" % pformat(evaluator.state.metrics)))
 
     log_dir = make_logdir(args.pretrained_model_path)
     tb_logger = TensorboardLogger(log_dir)
@@ -305,8 +348,11 @@ def train():
         tag="training", metric_names=["loss"]), event_name=Events.ITERATION_COMPLETED)
     tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(
         optimizer), event_name=Events.ITERATION_STARTED)
-    tb_logger.attach(evaluator, log_handler=OutputHandler(tag="validation", metric_names=list(
-        metrics.keys()), global_step_transform=global_step_from_engine(trainer)), event_name=Events.EPOCH_COMPLETED)
+
+    if args.val_dataset or \
+        args.val_cache:
+        tb_logger.attach(evaluator, log_handler=OutputHandler(tag="validation", metric_names=list(
+            metrics.keys()), global_step_transform=global_step_from_engine(trainer)), event_name=Events.EPOCH_COMPLETED)
 
     checkpoint_handler = ModelCheckpoint(
         log_dir, 'checkpoint', save_interval=1, n_saved=3)

@@ -45,16 +45,11 @@ def reply_encoder(tokenizer, reply):
 
 
 def segments_encoder(tokenizer, history, belief, kb, reply):
-    out = list()
-    if history:
-        out.append(history_encoder(tokenizer, history))
-    if belief:
-        out.append(belief_encoder(tokenizer, belief))
-    if kb:
-        out.append(kb_encoder(tokenizer, kb))
-    if reply:
-        out.append(reply_encoder(tokenizer, reply))
-
+    out = 4*[None]
+    out[0] = history_encoder(tokenizer, history) if history else []
+    out[1] = belief_encoder(tokenizer, belief) if belief else []
+    out[2] = kb_encoder(tokenizer, kb) if kb else []
+    out[3] = reply_encoder(tokenizer, reply) if reply else []
     return tuple(out)
 
 
