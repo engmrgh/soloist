@@ -210,7 +210,6 @@ def test_model(model, tokenizer, args):
 
 
 def train():
-    # TODO: add n_candidates in the config
     # TODO: read about fp16
     parser = ArgumentParser()
     parser.add_argument("--train_dataset", type=str, default="",
@@ -247,6 +246,8 @@ def train():
                         help="Max history turns fed to model")
     parser.add_argument("--n_fake_instances", type=int, default=10,
                         help="Number of generated fake instances to train reply, belief contradiction")
+    parser.add_argument("--fp16", type=str, default="",
+                        help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
     args = parser.parse_args()
 
     # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only,
@@ -266,6 +267,11 @@ def train():
     add_special_tokens(model, tokenizer)
     optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
 
+     # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
+    if args.fp16:
+        from apex import amp  # Apex is only required if we use fp16 training
+        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16)
+
     logger.info("Prepare datasets")
     train_loader, val_loader = get_data_loaders(args, tokenizer)
 
@@ -279,8 +285,13 @@ def train():
             mc_labels=mc_labels, lm_labels=lm_labels
         )
         loss = (lm_loss + mc_loss) / args.gradient_accumulation_steps
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
+        if args.fp16:
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+            torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_norm)
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
         if engine.state.iteration % args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
