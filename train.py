@@ -300,9 +300,9 @@ def train():
     evaluator = Engine(inference)
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
-    trainer.add_event_handler(Events.EPOCH_COMPLETED,
+    trainer.add_event_handler(Events.ITERATION_STARTED(every=1000),
                                 lambda _: evaluator.run(val_loader))
-    trainer.add_event_handler(Events.ITERATION_STARTED(every=50),
+    trainer.add_event_handler(Events.ITERATION_STARTED(every=1000),
                                 lambda _: test_model(model, tokenizer, args))
     if args.n_epochs < 1:
         trainer.add_event_handler(
@@ -331,23 +331,32 @@ def train():
     pbar = ProgressBar(persist=True)
     pbar.attach(trainer, metric_names=["loss"])
 
-    evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message(
+    evaluator.add_event_handler(Events.ITERATION_STARTED(every=1000), lambda _: pbar.log_message(
         "Validation: %s" % pformat(evaluator.state.metrics)))
 
     log_dir = make_logdir(args.pretrained_model_path)
     tb_logger = TensorboardLogger(log_dir)
 
-    tb_logger.attach(trainer, log_handler=OutputHandler(
-        tag="training", metric_names=["loss"]), event_name=Events.ITERATION_COMPLETED)
-    tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(
-        optimizer), event_name=Events.ITERATION_STARTED)
-    tb_logger.attach(evaluator, log_handler=OutputHandler(tag="validation", metric_names=list(
-        metrics.keys()), global_step_transform=global_step_from_engine(trainer)), event_name=Events.EPOCH_COMPLETED)
+    tb_logger.attach(trainer,
+                     log_handler=OutputHandler(tag="training",
+                                               metric_names=["loss"]),
+                     event_name=Events.ITERATION_COMPLETED)
+    tb_logger.attach(trainer,
+                     log_handler=OptimizerParamsHandler(optimizer),
+                     event_name=Events.ITERATION_STARTED)
+    tb_logger.attach(evaluator,
+                     log_handler=OutputHandler(tag="validation",
+                                               metric_names=list(metrics.keys()),
+                                               global_step_transform=global_step_from_engine(trainer)),
+                     event_name=Events.ITERATION_STARTED(every=1000))
 
-    checkpoint_handler = ModelCheckpoint(
-        log_dir, 'checkpoint', save_interval=1, n_saved=3)
+    checkpoint_handler = ModelCheckpoint(log_dir,
+                                         'checkpoint',
+                                         save_interval=1, n_saved=3)
     to_load = to_save = {'mymodel': getattr(model, 'module', model)}
-    trainer.add_event_handler(Events.ITERATION_STARTED(every=100), checkpoint_handler, to_save)  # "getattr" takes care of distributed encapsulation
+    trainer.add_event_handler(Events.ITERATION_STARTED(every=1000),
+                              checkpoint_handler,
+                              to_save)  # "getattr" takes care of distributed encapsulation
 
     if args.model_checkpoint:
         logger.info('Loading checkpoint from %s', args.model_checkpoint)
