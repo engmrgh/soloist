@@ -102,41 +102,23 @@ def make_logdir(model_name: str):
 
 def get_data_loaders(args, tokenizer):
     # Load train dataset
-    if args.train_cache and os.path.exists(args.train_cache):
-        logger.info("Loading train dataset from cache {}".format(args.train_cache))
-        train_dataset = torch.load(args.train_cache)
-    else:
-        logger.info("Loading train dataset from file {}".format(args.train_dataset))
-        train_dataset = \
-            SoloistDataset(args.train_dataset,
-                            tokenizer,
-                            max_seq_length=args.max_seq_length,
-                            max_turns=args.max_turns,
-                            n_fake_instances=args.n_fake_instances)
-
-        if args.train_cache:
-            p = Path(args.train_cache)
-            p.parent.mkdir(exist_ok=True, parents=True)
-            torch.save(train_dataset, args.train_cache)
+    train_dataset = \
+        SoloistDataset(args.train_dataset,
+                        args.train_cache,
+                        tokenizer,
+                        max_seq_length=args.max_seq_length,
+                        max_turns=args.max_turns,
+                        n_fake_instances=args.n_fake_instances)
 
     # Load validation dataset
-    valid_dataset = None
-    if args.val_cache and os.path.exists(args.val_cache):
-        logger.info("Loading validation dataset from cache {}".format(args.val_cache))
-        valid_dataset = torch.load(args.val_cache)
-    elif args.val_dataset:
-        logger.info("Loading validation dataset from file {}".format(args.val_dataset))
+    if args.val_dataset:
         valid_dataset = \
             SoloistDataset(args.val_dataset,
-                            tokenizer,
-                            max_seq_length=args.max_seq_length,
-                            max_turns=args.max_turns,
-                            n_fake_instances=args.n_fake_instances)
-
-        if args.val_cache:
-            p = Path(args.val_cache)
-            p.parent.mkdir(exist_ok=True, parents=True)
-            torch.save(valid_dataset, args.val_cache)
+                           args.val_cache,
+                           tokenizer,
+                           max_seq_length=args.max_seq_length,
+                           max_turns=args.max_turns,
+                           n_fake_instances=args.n_fake_instances)
     else:
         train_dataset_size = int(0.9 * len(train_dataset))
         val_dataset_size = len(train_dataset) - train_dataset_size

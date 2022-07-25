@@ -1,4 +1,3 @@
-import torch
 from itertools import chain
 
 
@@ -54,7 +53,7 @@ def segments_encoder(tokenizer, history, belief, kb, reply):
 
 
 def create_input_ids(sequence):
-    return torch.as_tensor(list(chain(*sequence)))
+    return list(chain(*sequence))
 
 
 def create_token_type_ids(tokenizer, sequence):
@@ -81,7 +80,7 @@ def create_token_type_ids(tokenizer, sequence):
         ptr = new_ptr
 
     token_type_ids += [system_id] * (len(belief) + len(kb) + len(reply))
-    return torch.as_tensor(token_type_ids)
+    return token_type_ids
 
 
 def create_lm_labels(sequence, fake=False):
@@ -93,4 +92,4 @@ def create_lm_labels(sequence, fake=False):
             segment_lm_labels = [-100] * len(segment) if i%2==0 else segment
             lm_labels.extend(segment_lm_labels)
 
-    return torch.as_tensor(lm_labels)
+    return lm_labels

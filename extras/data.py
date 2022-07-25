@@ -1,4 +1,5 @@
 import json
+import os
 import torch
 import random
 import logging
@@ -21,24 +22,23 @@ ALL_MODEL_INPUTS = MODEL_VECTOR_INPUTS + ["mc_label", "mc_token_ids"]
 
 
 class SoloistDataset(Dataset):
-    def __init__(self, dataset_path, tokenizer, max_seq_length, max_turns, n_fake_instances):
+    def __init__(self, dataset_path, dataset_cache, tokenizer, max_seq_length, max_turns, n_fake_instances):
         logger.info("Loading dataset from {}...".format(dataset_path))
         self._max_seq_length = max_seq_length
         self._max_turns = max_turns
         self._n_fake_instances = n_fake_instances
-        self._examples = self.load_dataset(dataset_path, tokenizer)
+        self._dataset_cache = dataset_cache
+        if not os.path.exists(dataset_cache):
+            self.process_and_store(dataset_path, tokenizer, dataset_cache)
 
-    def load_dataset(self, dataset_path, tokenizer):
-
+    def process_and_store(self, dataset_path, tokenizer, dataseet_cache):
         logger.info("Getting reply and belief pool...")
         reply_pool, belief_pool = self.get_all_replies_and_beliefs(
             dataset_path)
 
         logger.info("Building examples...")
-        examples = self.build_examples(
-            tokenizer, dataset_path, reply_pool, belief_pool)
-
-        return examples
+        self.build_and_save_examples(
+            tokenizer, dataset_path, dataseet_cache, reply_pool, belief_pool)
 
     def get_all_replies_and_beliefs(self, dataset_path):
         with open(dataset_path) as f:
@@ -55,11 +55,10 @@ class SoloistDataset(Dataset):
 
         return reply_pool, belief_pool
 
-    def build_examples(self, tokenizer, dataset_path, reply_pool, belief_pool):
-        with open(dataset_path) as f:
+    def build_and_save_examples(self, tokenizer, dataset_path, dataset_cache, reply_pool, belief_pool):
+        with open(dataset_path) as f, open(dataset_cache, "w") as cf:
             data = json.load(f)
 
-            examples = list()
             for record in tqdm(data):
                 sample = list()
 
@@ -72,7 +71,7 @@ class SoloistDataset(Dataset):
                         record["reply"],
                         fake=False,
                     )
-                if s["input_ids"].shape[0] > self._max_seq_length:
+                if len(s["input_ids"]) > self._max_seq_length:
                     continue
                 sample.append(s)
 
@@ -89,13 +88,10 @@ class SoloistDataset(Dataset):
                         false_reply,
                         fake=True,
                     )
-                    if s["input_ids"].shape[0] <= self._max_seq_length:
+                    if len(s["input_ids"]) <= self._max_seq_length:
                         sample.append(s)
                         fake_counter += 1
-
-                examples.append(sample)
-
-        return examples
+                cf.write(json.dumps(sample) + "\n")
 
     def _build_input_from_segments(
         self, tokenizer, history, belief, kb, reply, fake=False
@@ -127,21 +123,33 @@ class SoloistDataset(Dataset):
         return [example[input_name] for example in examples]
 
     def __len__(self):
-        return len(self._examples)
+        with open(self._dataset_cache, encoding='utf-8') as f:
+            num_examples = sum(1 for line in f)
+        return num_examples
 
     def __getitem__(self, index):
         REAL_INSTANCE_POSITION = 0
 
-        example = {input_name: list()
-                   for input_name in MODEL_VECTOR_INPUTS + ["mc_token_ids"]}
-        random_index = list(range(len(self._examples[index])))
-        random.shuffle(random_index)
+        with open(self._dataset_cache) as f:
+            for _ in range(index):
+                next(f)
 
-        for input_name in MODEL_VECTOR_INPUTS + ["mc_token_ids"]:
-            inp = self._extract_input(input_name, self._examples[index])
-            for ri in random_index:
-                example[input_name].append(inp[ri])
-        example["mc_label"] = random_index.index(REAL_INSTANCE_POSITION)
+            _examples = json.loads(next(f))
+            for ex in _examples:
+                ex['input_ids'] = torch.tensor(ex['input_ids'])
+                ex['token_type_ids'] = torch.tensor(ex['token_type_ids'])
+                ex['lm_labels'] = torch.tensor(ex['lm_labels'])
+
+            example = {input_name: list()
+                    for input_name in MODEL_VECTOR_INPUTS + ["mc_token_ids"]}
+            random_index = list(range(len(_examples)))
+            random.shuffle(random_index)
+
+            for input_name in MODEL_VECTOR_INPUTS + ["mc_token_ids"]:
+                inp = self._extract_input(input_name, _examples)
+                for ri in random_index:
+                    example[input_name].append(inp[ri])
+            example["mc_label"] = random_index.index(REAL_INSTANCE_POSITION)
 
         return example
 
