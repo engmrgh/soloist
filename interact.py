@@ -1,64 +1,181 @@
-import logging
-import random
 import json
+import sqlite3
 from argparse import ArgumentParser
+import logging
 from itertools import chain
-from pprint import pformat
 import warnings
 
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
-
+from ignite.metrics import Bleu
 from transformers import (
-    OpenAIGPTLMHeadModel,
-    OpenAIGPTTokenizer,
-    GPT2LMHeadModel,
+    GPT2DoubleHeadsModel,
     GPT2Tokenizer,
 )
 
-from train import (
-    SPECIAL_TOKENS,
-    build_input_from_segments,
-    add_special_tokens,
-    encode_segments,
-    create_token_type_ids,
-    create_lm_labels
-)
+from train import SPECIAL_TOKENS
+from extras.metrics import Inform, Success, Combined
+from extras.utils import create_input_ids, create_token_type_ids, segments_encoder
 
 
-def top_filtering(
-    logits, top_k=0.0, top_p=0.9, threshold=-float("Inf"), filter_value=-float("Inf")
-):
-    """Filter a distribution of logits using top-k, top-p (nucleus) and/or threshold filtering
-    Args:
-        logits: logits distribution shape (vocabulary size)
-        top_k: <=0: no filtering, >0: keep only top k tokens with highest probability.
-        top_p: <=0.0: no filtering, >0.0: keep only a subset S of candidates, where S is the smallest subset
-            whose total probability mass is greater than or equal to the threshold top_p.
-            In practice, we select the highest probability tokens whose cumulative probability mass exceeds
-            the threshold top_p.
-        threshold: a minimal threshold to keep logits
+MAX_BELIEF_SIZE = 64
+MAX_SEQUENCE_LENGTH = 512
+
+logger = logging.getLogger(__file__)
+logger.setLevel(logging.DEBUG)
+
+
+def index(arr, val):
+    indices = (arr == val).nonzero().squeeze().numpy()
+    try:
+        return indices.item()
+    except ValueError:
+        return indices[0].item()
+
+
+def extrace_belief_from_generated(tokenizer, generated):
+    (eob,) = tokenizer.convert_tokens_to_ids(["<eob>"])
+    eob_index = index(generated, eob) if eob in generated else len(generated)
+    belief = tokenizer.convert_ids_to_tokens(generated[:eob_index])
+    if not belief:
+        return "belief : none"
+    else:
+        return "belief : " + " ".join(belief)
+
+
+def extrace_response_from_generated(tokenizer, generated):
+    (eos,) = tokenizer.convert_tokens_to_ids(["<eos>"])
+    eos_index = index(generated, eos) if eos in generated else len(generated)
+    reply = tokenizer.convert_ids_to_tokens(generated[:eos_index])
+    return " ".join(reply)
+
+
+def connect_to_db():
+    domains = [
+        "restaurant",
+        "hotel",
+        "attraction",
+        "train",
+    ]  # , 'police', 'taxi', 'hospital']
+    dbs = {}
+    columns = {}
+    for domain in domains:
+        db = "db/{}-dbase.db".format(domain)
+
+        conn = sqlite3.connect(db)
+        c = conn.cursor()
+        dbs[domain] = c
+
+        cursor = c.execute("SELECT * FROM {}".format(domain))
+        columns[domain] = list(
+            map(lambda x: x[0].strip().lower(), cursor.description))
+    return dbs, columns
+
+
+def convert_from_digit_to_word(domain, count):
+    if domain != "train":
+        if count > 5:
+            kb_nums = "more than five"
+        elif count == 0:
+            kb_nums = "zero"
+        elif count == 1:
+            kb_nums = "one"
+        elif count == 2:
+            kb_nums = "two"
+        elif count == 3:
+            kb_nums = "three"
+        elif count == 4:
+            kb_nums = "four"
+    else:
+        if count > 40:
+            kb_nums = "more than five"
+        elif count == 0:
+            kb_nums = "zero"
+        elif count <= 2:
+            kb_nums = "one"
+        elif count <= 5:
+            kb_nums = "two"
+        elif count <= 10:
+            kb_nums = "three"
+        elif count <= 40:
+            kb_nums = "four"
+    return f"{domain} {kb_nums}"
+
+
+def query_knowledge_base(dbs, columns, belief):
+    segments = " ".join(belief[2:]).split("|")
+
+    db_information = ""
+    for segment in segments:
+        domain = segment.strip().lower().split(" ", maxsplit=1)[0].strip()
+        constraints = map(
+            str.strip, segment.strip().lower().split(
+                " ", maxsplit=1)[1].split(";")
+        )
+
+        if domain not in dbs.keys() or domain in {"none", "hospital", "taxi", "police"}:
+            continue
+
+        query = "SELECT * FROM {} WHERE ".format(domain)
+        first_one = True
+        for const in constraints:
+            slot, value = map(str.strip, const.split("="))
+            if slot not in columns[domain]:
+                continue
+
+            if not first_one:
+                query += "AND "
+            first_one = False
+
+            value.replace("'", "''")
+            if slot == "leaveat":
+                query += "{}>'{}' ".format(slot, value)
+            elif slot == "arriveby":
+                query += "{}<'{}' ".format(slot, value)
+            else:
+                query += "{}='{}' ".format(slot, value)
+
+        try:
+            count = len(dbs[domain].execute(query).fetchall())
+            count_in_word = convert_from_digit_to_word(domain, count)
+            db_information += count_in_word + ", "
+        except sqlite3.OperationalError as e:
+            logger.warning(query, str(e))
+
+    return "kb : {}".format(db_information)
+
+
+def top_filtering(logits, top_k=0., top_p=0.9, threshold=-float('Inf'), filter_value=-float('Inf')):
+    """ Filter a distribution of logits using top-k, top-p (nucleus) and/or threshold filtering
+        Args:
+            logits: logits distribution shape (vocabulary size)
+            top_k: <=0: no filtering, >0: keep only top k tokens with highest probability.
+            top_p: <=0.0: no filtering, >0.0: keep only a subset S of candidates, where S is the smallest subset
+                whose total probability mass is greater than or equal to the threshold top_p.
+                In practice, we select the highest probability tokens whose cumulative probability mass exceeds
+                the threshold top_p.
+            threshold: a minimal threshold to keep logits
     """
-    assert (
-        logits.dim() == 1
-    )  # Only work for batch size 1 for now - could update but it would obfuscate a bit the code
+    assert logits.dim() == 1  # Only work for batch size 1 for now - could update but it would obfuscate a bit the code
     top_k = min(top_k, logits.size(-1))
     if top_k > 0:
         # Remove all tokens with a probability less than the last token in the top-k tokens
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        indices_to_remove = logits < torch.topk(logits, top_k)[
+            0][..., -1, None]
         logits[indices_to_remove] = filter_value
 
     if top_p > 0.0:
         # Compute cumulative probabilities of sorted tokens
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probabilities = torch.cumsum(
-            F.softmax(sorted_logits, dim=-1), dim=-1
-        )
+            F.softmax(sorted_logits, dim=-1), dim=-1)
 
         # Remove tokens with cumulative probability above the threshold
         sorted_indices_to_remove = cumulative_probabilities > top_p
         # Shift the indices to the right to keep also the first token above the threshold
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[...,
+                                 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
         # Back to unsorted indices and set them to -infinity
@@ -71,54 +188,51 @@ def top_filtering(
     return logits
 
 
-def encode_information(tokenizer, history, belief, kb, reply):
-    history, belief, kb, reply = encode_segments(tokenizer, history, belief, kb, reply)
+def get_sequence(tokenizer, history, belief, kb, current_output):
+    ind, eob, eokb = tokenizer.convert_tokens_to_ids(["=>", "<eob>", "<eokb>"])
 
-    # NOTE: I didn't add bos token based on article
-    ind, eob, eokb, eos = tokenizer.convert_tokens_to_ids(["=>", "<eob>", "<eokb>", "<eos>"])
-    sequence = [list(chain(*history))] + \
-               [[ind] + belief + [eob]] + \
-               [kb + [eokb]] + \
-               [reply + [eos]]
+    if belief and kb:
+        history, belief, kb, _ = segments_encoder(
+            tokenizer, history, belief, kb, reply=None)
+        return (
+            [list(chain(*history)) + [ind]] +
+            [belief + [eob]] +
+            [kb + [eokb]] +
+            [current_output]
+        )
+    else:
+        history, *_ = segments_encoder(tokenizer, history, belief=None, kb=None, reply=None)
+        return (
+            [list(chain(*history)) + [ind]] +
+            [current_output]
+        )
 
-    instance = {}
-    instance["input_ids"] = list(chain(*sequence))
-    instance["token_type_ids"] = create_token_type_ids(sequence, tokenizer)
-    instance["mc_token_ids"] = len(instance["input_ids"]) - 1
-    instance["lm_labels"] = create_lm_labels(sequence, tokenizer)
 
-    return instance
-
-
-def sample_sequence(history, belief, kb, tokenizer, model, args, current_output=None):
+def sample_sequence(model, tokenizer, history, belief, kb, args):
     special_tokens_ids = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS)
-    if current_output is None:
-        current_output = []
 
+    current_output = []
     for i in range(args.max_length):
-        instance = encode_information(history, current_output, tokenizer)
+        sequence = get_sequence(tokenizer, history, belief, kb, current_output)
+        input_ids = create_input_ids(sequence)
+        token_type_ids = create_token_type_ids(tokenizer, sequence)
 
-        input_ids = torch.tensor(instance["input_ids"], device=args.device).unsqueeze(0)
-        token_type_ids = torch.tensor(
-            instance["token_type_ids"], device=args.device
-        ).unsqueeze(0)
+        input_ids = input_ids.to(args.device)
+        token_type_ids= token_type_ids.to(args.device)
 
         logits = model(input_ids, token_type_ids=token_type_ids)
         if isinstance(logits, tuple):  # for gpt2 and maybe others
             logits = logits[0]
-        logits = logits[0, -1, :] / args.temperature
+        logits = logits[-1, :] / args.temperature
         logits = top_filtering(logits, top_k=args.top_k, top_p=args.top_p)
         probs = F.softmax(logits, dim=-1)
 
-        prev = (
-            torch.topk(probs, 1)[1] if args.no_sample else torch.multinomial(probs, 1)
-        )
+        prev = torch.topk(probs, 1)[1] if args.no_sample else torch.multinomial(probs, 1)
         if i < args.min_length and prev.item() in special_tokens_ids:
             while prev.item() in special_tokens_ids:
                 if probs.max().item() == 1:
                     warnings.warn(
-                        "Warning: model generating special token with probability 1."
-                    )
+                        "Warning: model generating special token with probability 1.")
                     break  # avoid infinitely looping over special token
                 prev = torch.multinomial(probs, num_samples=1)
 
@@ -129,145 +243,71 @@ def sample_sequence(history, belief, kb, tokenizer, model, args, current_output=
     return current_output
 
 
-def load_dataset(tokenizer, dataset_path):
-    datasets = {"train": [], "valid": [], "test": []}
-    for dataset_name in datasets:
-        datasets[dataset_name] = fetch_and_encode_data(tokenizer, "{}/{}.soloist.json".format(dataset_path, dataset_name))
-
-
-def fetch_and_encode_data(tokenizer, file_path):
-    encoded_data = list()
-    with open(file_path) as f:
-        data = json.load(f)
-        for record in data:
-            history, belief, kb, reply = \
-                encode_segments(tokenizer, record["history"], record["belief"], record["kb"], record["reply"])
-            encoded_data.append({
-                "history": history,
-                "belief": belief,
-                "kb": kb,
-                "reply": reply
-            })
-    return encoded_data
-
-
-def run():
+def main():
     parser = ArgumentParser()
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default="data_sample",
-        help="Path or url of the dataset. If empty download from S3.",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="openai-gpt",
-        help="Model type (openai-gpt or gpt2)",
-        choices=["openai-gpt", "gpt2"],
-    )  # anything besides gpt2 will load openai-gpt
-    parser.add_argument(
-        "--model_checkpoint",
-        type=str,
-        default="runs/Jul08_21-58-47_omen_gpt2",
-        help="Path, url or short name of the model",
-    )
-    parser.add_argument(
-        "--max_history",
-        type=int,
-        default=2,
-        help="Number of previous utterances to keep in history",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device (cuda or cpu)",
-    )
-
-    parser.add_argument(
-        "--no_sample",
-        action="store_true",
-        help="Set to use greedy decoding instead of sampling",
-    )
-    parser.add_argument(
-        "--max_length",
-        type=int,
-        default=20,
-        help="Maximum length of the output utterances",
-    )
-    parser.add_argument(
-        "--min_length",
-        type=int,
-        default=1,
-        help="Minimum length of the output utterances",
-    )
+    parser.add_argument("--testset", type=str,
+                        default="data/test.soloist.json", help="Dataset for evaulating model performance")
+    parser.add_argument("--checkpoint", type=str,
+                        default="", help="Path, url or short name of the model")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
+                        else "cuda", help="Device (cuda or cpu)")
+    parser.add_argument("--max_length", type=int, default=50,
+                        help="Maximum length of the output utterances")
+    parser.add_argument("--min_length", type=int, default=1,
+                        help="Minimum length of the output utterances")
+    parser.add_argument("--no_sample", action='store_true',
+                        help="Set to use greedy decoding instead of sampling")
     parser.add_argument("--seed", type=int, default=0, help="Seed")
-    parser.add_argument(
-        "--temperature", type=float, default=0.7, help="Sampling softmax temperature"
-    )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=0,
-        help="Filter top-k tokens before sampling (<=0: no filtering)",
-    )
-    parser.add_argument(
-        "--top_p",
-        type=float,
-        default=0.9,
-        help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)",
-    )
+    parser.add_argument("--temperature", type=float,
+                        default=0.7, help="Sampling softmax temperature")
+    parser.add_argument("--top_k", type=int, default=0,
+                        help="Filter top-k tokens before sampling (<=0: no filtering)")
+    parser.add_argument("--top_p", type=float, default=0.9,
+                        help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
+    parser.add_argument("--max_turn", type=int, default=5,
+                        help="Maximum number of history turns fed to model")
+
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__file__)
-    logger.info(pformat(args))
+    tokenizer = GPT2Tokenizer.from_pretrained(args.checkpoint)
+    model = GPT2DoubleHeadsModel.from_pretrained(args.checkpoint)
 
-    if args.model_checkpoint == "":
-        if args.model == "gpt2":
-            raise ValueError(
-                "Interacting with GPT2 requires passing a finetuned model_checkpoint"
-            )
+    dbs, columns = connect_to_db()
 
-    if args.seed != 0:
-        random.seed(args.seed)
-        torch.random.manual_seed(args.seed)
-        torch.cuda.manual_seed(args.seed)
+    with open(args.testset, "r") as f:
+        testset = json.load(f)
 
-    logger.info("Get pretrained model and tokenizer")
-    tokenizer_class, model_class = (
-        (GPT2Tokenizer, GPT2LMHeadModel)
-        if args.model == "gpt2"
-        else (OpenAIGPTTokenizer, OpenAIGPTLMHeadModel)
-    )
-    tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
-    model = model_class.from_pretrained(args.model_checkpoint)
     model.to(args.device)
-    add_special_tokens(model, tokenizer)
+    model.eval()
+    metrics = {"bleu": Bleu(), "inform": Inform(), "success": Success()}
+    metrics.update({"combined": Combined(metrics)})
+    with torch.no_grad():
+        for ent in tqdm(testset, desc="Evaluating model"):
+            # Round 1: generating belief
+            belief = sample_sequence(model=model,
+                                     tokenizer=tokenizer,
+                                     history=ent["history"][-args.max_turn:],
+                                     belief=None,
+                                     kb=None,
+                                     args=args)
+            belief = tokenizer.decode(belief)
+            kb = query_knowledge_base(dbs, columns, belief)
 
-    # logger.info("Sample a personality")
-    # dataset = load_dataset(tokenizer, args.dataset_path)
-    # history = [
-    #     record["history"] for record in 0.values() for entry in dataset
-    # ]
-    # personality = random.choice(history)
-    # logger.info("Selected personality: %s", tokenizer.decode(chain(*personality)))
+            # Round 2: generating response from belief
+            reply = sample_sequence(model=model,
+                                    tokenizer=tokenizer,
+                                    history=ent["history"][-args.max_turn:],
+                                    belief=belief,
+                                    kb=kb,
+                                    args=args)
+            reply = tokenizer.decode(reply)
 
-    history = []
-    while True:
-        raw_text = input(">>> ")
-        while not raw_text:
-            print("Prompt should not be empty!")
-            raw_text = input(">>> ")
-        history.append(tokenizer.encode(raw_text))
-        with torch.no_grad():
-            out_ids = sample_sequence(history, tokenizer, model, args)
-        history.append(out_ids)
-        history = history[-(2 * args.max_history + 1) :]
-        out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
-        print(out_text)
+            for name, metric in metrics.items():
+                metric.update(([reply.split()], [[ent["reply"].split()]]))
+
+    for name, metric in metrics.items():
+        print("{}: {:.4f}".format(name, metric.compute()))
 
 
 if __name__ == "__main__":
-    run()
+    main()
