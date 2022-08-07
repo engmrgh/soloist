@@ -230,7 +230,7 @@ def train():
                         help="Number of generated fake instances to train reply, belief contradiction")
     parser.add_argument("--fp16", type=str, default="",
                         help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
-    parser.add_argument("--train_itration", type=int, default=1000,
+    parser.add_argument("--train_iteration", type=int, default=1000,
                         help="Number of training itration between each evaluation station")
     args = parser.parse_args()
 
@@ -301,9 +301,9 @@ def train():
     evaluator = Engine(inference)
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
-    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_itration),
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_iteration),
                                 lambda _: evaluator.run(val_loader))
-    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_itration),
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_iteration),
                                 lambda _: test_model(model, tokenizer, args))
     if args.n_epochs < 1:
         trainer.add_event_handler(
@@ -322,9 +322,7 @@ def train():
     metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100),
                            output_transform=lambda x: (x[0][0], x[1][0])),
                "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
-    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
-                    "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
-    metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
+    metrics["ppl"] = MetricsLambda(math.exp, metrics["nll"])
     for name, metric in metrics.items():
         metric.attach(evaluator, name)
 
