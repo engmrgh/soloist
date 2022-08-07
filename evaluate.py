@@ -17,6 +17,7 @@ from transformers import (
 from train import SPECIAL_TOKENS
 from extras.metrics import Inform, Success, Combined
 from extras.utils import create_input_ids, create_token_type_ids, segments_encoder
+from multiwoz.evaluate import MultiWozEvaluator
 
 
 MAX_BELIEF_SIZE = 64
@@ -105,8 +106,8 @@ def sample_sequence(model, tokenizer, history, belief, kb, args):
         input_ids = create_input_ids(sequence)
         token_type_ids = create_token_type_ids(tokenizer, sequence)
 
-        input_ids = input_ids.to(args.device)
-        token_type_ids= token_type_ids.to(args.device)
+        input_ids = torch.as_tensor(input_ids).to(args.device)
+        token_type_ids = torch.as_tensor(token_type_ids).to(args.device)
 
         logits = model(input_ids, token_type_ids=token_type_ids)
         if isinstance(logits, tuple):  # for gpt2 and maybe others
@@ -133,8 +134,10 @@ def sample_sequence(model, tokenizer, history, belief, kb, args):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--testset", type=str,
-                        default="data/test.soloist.json", help="Dataset for evaulating model performance")
+    parser.add_argument("--soloist-testset", type=str,
+                        default="data/multiwoz/test.soloist.json", help="Dataset which responses are generated.")
+    parser.add_argument("--multiwoz-testset", type=str,
+                        default="data/multiwoz/test_dials.json", help="Dataset which responses are refrenced.")
     parser.add_argument("--checkpoint", type=str,
                         default="", help="Path, url or short name of the model")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
@@ -160,17 +163,18 @@ def main():
     tokenizer = GPT2Tokenizer.from_pretrained(args.checkpoint)
     model = GPT2DoubleHeadsModel.from_pretrained(args.checkpoint)
 
-    dbs, columns = connect_to_db()
+    with open(args.soloist_testset, "r") as f:
+        generated_testset = json.load(f)
+    with open(args.multiwoz_testset) as outfile:
+        refrence_testset = json.load(outfile)
 
-    with open(args.testset, "r") as f:
-        testset = json.load(f)
-
+    evaluator_test = MultiWozEvaluator("test")
     model.to(args.device)
     model.eval()
-    metrics = {"bleu": Bleu(), "inform": Inform(), "success": Success()}
-    metrics.update({"combined": Combined(metrics)})
+
+    generated_dialogues = dict()
     with torch.no_grad():
-        for ent in tqdm(testset, desc="Evaluating model"):
+        for ent in tqdm(generated_testset, desc="Evaluating model"):
             # Round 1: generating belief
             belief = sample_sequence(model=model,
                                      tokenizer=tokenizer,
@@ -179,22 +183,20 @@ def main():
                                      kb=None,
                                      args=args)
             belief = tokenizer.decode(belief)
-            kb = query_knowledge_base(dbs, columns, belief)
 
             # Round 2: generating response from belief
             reply = sample_sequence(model=model,
                                     tokenizer=tokenizer,
                                     history=ent["history"][-args.max_turn:],
-                                    belief=belief,
-                                    kb=kb,
+                                    belief=ent["belief"],
+                                    kb=ent["kb"],
                                     args=args)
             reply = tokenizer.decode(reply)
+            if ent['name'] not in generated_dialogues:
+                generated_dialogues[ent['name']] = list()
+            generated_dialogues[ent['name']].append(reply)
 
-            for name, metric in metrics.items():
-                metric.update(([reply.split()], [[ent["reply"].split()]]))
-
-    for name, metric in metrics.items():
-        print("{}: {:.4f}".format(name, metric.compute()))
+    evaluator_test.evaluateModel(generated_dialogues, refrence_testset, mode='test')
 
 
 if __name__ == "__main__":
