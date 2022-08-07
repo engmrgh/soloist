@@ -61,7 +61,7 @@ class SoloistDataset(Dataset):
         return reply_pool, belief_pool
 
     def build_and_save_examples(self, tokenizer, dataset_path, reply_pool, belief_pool):
-        with open(dataset_path) as f, open(self.dataset_cache, "w") as cf:
+        with open(dataset_path) as f, open(self._dataset_cache, "w") as cf:
             data = json.load(f)
 
             for record in tqdm(data):

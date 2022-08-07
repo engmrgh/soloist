@@ -352,7 +352,7 @@ def train():
 
     checkpoint_handler = ModelCheckpoint(log_dir, 'checkpoint', n_saved=3)
     to_load = to_save = {'mymodel': getattr(model, 'module', model)}
-    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_itration),
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_iteration),
                               checkpoint_handler,
                               to_save)  # "getattr" takes care of distributed encapsulation
 
