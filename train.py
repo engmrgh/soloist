@@ -111,7 +111,7 @@ def get_data_loaders(args, tokenizer):
                         n_fake_instances=args.n_fake_instances)
 
     # Load validation dataset
-    if args.val_dataset:
+    if args.val_dataset or args.val_cache:
         valid_dataset = \
             SoloistDataset(args.val_dataset,
                            args.val_cache,
@@ -230,6 +230,8 @@ def train():
                         help="Number of generated fake instances to train reply, belief contradiction")
     parser.add_argument("--fp16", type=str, default="",
                         help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
+    parser.add_argument("--train_itration", type=int, default=1000,
+                        help="Number of training itration between each evaluation station")
     args = parser.parse_args()
 
     # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only,
@@ -287,22 +289,21 @@ def train():
             batch = tuple(input_tensor.to(args.device)
                           for input_tensor in batch)
             input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids, attention_mask = batch
-            logger.info(tokenizer.decode(input_ids[0, -1, :].tolist()))
             # if we dont send labels to model, it doesnt return losses
             lm_logits, mc_logits, *_ = model(
                 input_ids, token_type_ids=token_type_ids, mc_token_ids=mc_token_ids,
             )
-            lm_logits_flat_shifted = lm_logits[..., :-1,
-                                               :].contiguous().view(-1, lm_logits.size(-1))
+            lm_logits_flat_shifted = lm_logits[..., :-1,:].contiguous() \
+                                                          .view(-1, lm_logits.size(-1))
             lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
             return (lm_logits_flat_shifted, mc_logits), (lm_labels_flat_shifted, mc_labels)
 
     evaluator = Engine(inference)
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
-    trainer.add_event_handler(Events.ITERATION_STARTED(every=1000),
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_itration),
                                 lambda _: evaluator.run(val_loader))
-    trainer.add_event_handler(Events.ITERATION_STARTED(every=1000),
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_itration),
                                 lambda _: test_model(model, tokenizer, args))
     if args.n_epochs < 1:
         trainer.add_event_handler(
@@ -318,8 +319,9 @@ def train():
 
     # Prepare metrics
     RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
-    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
-            "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
+    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100),
+                           output_transform=lambda x: (x[0][0], x[1][0])),
+               "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
     metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
                     "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
     metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
@@ -331,8 +333,8 @@ def train():
     pbar = ProgressBar(persist=True)
     pbar.attach(trainer, metric_names=["loss"])
 
-    evaluator.add_event_handler(Events.ITERATION_STARTED(every=1000), lambda _: pbar.log_message(
-        "Validation: %s" % pformat(evaluator.state.metrics)))
+    evaluator.add_event_handler(Events.COMPLETED,
+                                lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
 
     log_dir = make_logdir(args.pretrained_model_path)
     tb_logger = TensorboardLogger(log_dir)
@@ -348,13 +350,11 @@ def train():
                      log_handler=OutputHandler(tag="validation",
                                                metric_names=list(metrics.keys()),
                                                global_step_transform=global_step_from_engine(trainer)),
-                     event_name=Events.ITERATION_STARTED(every=1000))
+                     event_name=Events.COMPLETED)
 
-    checkpoint_handler = ModelCheckpoint(log_dir,
-                                         'checkpoint',
-                                         save_interval=1, n_saved=3)
+    checkpoint_handler = ModelCheckpoint(log_dir, 'checkpoint', n_saved=3)
     to_load = to_save = {'mymodel': getattr(model, 'module', model)}
-    trainer.add_event_handler(Events.ITERATION_STARTED(every=1000),
+    trainer.add_event_handler(Events.ITERATION_COMPLETED(every=args.train_itration),
                               checkpoint_handler,
                               to_save)  # "getattr" takes care of distributed encapsulation
 

@@ -23,7 +23,7 @@ ALL_MODEL_INPUTS = MODEL_VECTOR_INPUTS + ["mc_label", "mc_token_ids"]
 
 class SoloistDataset(Dataset):
     def __init__(self, dataset_path, dataset_cache, tokenizer, max_seq_length, max_turns, n_fake_instances):
-        logger.info("Loading dataset from {}...".format(dataset_path))
+        logger.info("Loading dataset from {}...".format(dataset_path if dataset_path else dataset_cache))
         self._max_seq_length = max_seq_length
         self._max_turns = max_turns
         self._n_fake_instances = n_fake_instances
