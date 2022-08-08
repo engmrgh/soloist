@@ -203,7 +203,7 @@ def train():
     parser.add_argument("--val_cache", type=str, default="",
                         help="Path of the validation dataset cache")
     parser.add_argument("--pretrained_model_path", type=str,
-                        default="gpt2", help="Pretrained model name or ")
+                        default="gpt2", help="Pretrained model name or path")
     parser.add_argument("--model_checkpoint", type=str,
                         default="", help="Path, url or short name of the model")
     parser.add_argument("--train_batch_size", type=int,
