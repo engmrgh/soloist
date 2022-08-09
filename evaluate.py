@@ -109,9 +109,7 @@ def sample_sequence(model, tokenizer, history, belief, kb, args):
         input_ids = torch.as_tensor(input_ids).to(args.device)
         token_type_ids = torch.as_tensor(token_type_ids).to(args.device)
 
-        logits = model(input_ids, token_type_ids=token_type_ids)
-        if isinstance(logits, tuple):  # for gpt2 and maybe others
-            logits = logits[0]
+        logits = model(input_ids, token_type_ids=token_type_ids)[0]
         logits = logits[-1, :] / args.temperature
         logits = top_filtering(logits, top_k=args.top_k, top_p=args.top_p)
         probs = F.softmax(logits, dim=-1)
@@ -130,6 +128,31 @@ def sample_sequence(model, tokenizer, history, belief, kb, args):
         current_output.append(prev.item())
 
     return current_output
+
+
+def check_beliefs_equal(pred_belief, gold_belief):
+
+    def _parse_belief(belief):
+        _belief = belief.split(':', maxsplit=1)[1].strip()
+        if _belief.lower() == 'none':
+            return dict()
+
+        dict_belief = dict()
+        try:
+            for seg in _belief.split('|'):
+                domain, domain_belief = seg.strip().split(' ', maxsplit=1)
+                dict_belief[domain] = dict()
+                for state in domain_belief.split(';'):
+                    key, value = map(str.strip, state.strip().split('='))
+                    dict_belief[domain][key] = value
+        except ValueError:
+            pass
+        return dict_belief
+
+    dict_pred_belief = _parse_belief(pred_belief)
+    dict_gold_belief = _parse_belief(gold_belief)
+
+    return int(dict_pred_belief == dict_gold_belief)
 
 
 def main():
@@ -173,6 +196,7 @@ def main():
     model.eval()
 
     generated_dialogues = dict()
+    joint_acc = 0
     with torch.no_grad():
         for ent in tqdm(generated_testset, desc="Evaluating model"):
             # Round 1: generating belief
@@ -183,6 +207,7 @@ def main():
                                      kb=None,
                                      args=args)
             belief = tokenizer.decode(belief)
+            joint_acc += check_beliefs_equal(belief, ent["belief"])
 
             # Round 2: generating response from belief
             reply = sample_sequence(model=model,
@@ -196,6 +221,7 @@ def main():
                 generated_dialogues[ent['name']] = list()
             generated_dialogues[ent['name']].append(reply)
 
+    print('Joint Accuracy: {}'.format(joint_acc/len(generated_testset)))
     evaluator_test.evaluateModel(generated_dialogues, refrence_testset, mode='test')
 
 
