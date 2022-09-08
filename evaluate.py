@@ -221,6 +221,7 @@ def main():
                 generated_dialogues[ent['name']] = list()
             generated_dialogues[ent['name']].append(reply)
 
+
     print('Joint Accuracy: {}'.format(joint_acc/len(generated_testset)))
     evaluator_test.evaluateModel(generated_dialogues, refrence_testset, mode='test')
 
