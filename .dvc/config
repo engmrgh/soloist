@@ -1,0 +1,4 @@
+[core]
+    remote = go
+['remote "go"']
+    url = gdrive://11YjBH4b7gM5XoxVL3xiG0i1GBZGudUZ_/soloist
